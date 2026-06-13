@@ -1,6 +1,6 @@
 const express = require('express');
 const cors = require('cors');
-const { exec } = require('child_process');
+const { exec, execSync } = require('child_process');
 const { promisify } = require('util');
 
 const execAsync = promisify(exec);
@@ -8,10 +8,41 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(cors());
-app.use(express.json());
 
 const cache = new Map();
-const CACHE_TTL = 2 * 60 * 60 * 1000; // 2 hours
+const CACHE_TTL = 2 * 60 * 60 * 1000;
+
+// Try multiple strategies to get audio URL
+async function resolveAudio(videoId) {
+  const strategies = [
+    // Strategy 1: Android client (bypasses most bot detection)
+    `yt-dlp --no-playlist --no-warnings --extractor-args "youtube:player_client=android" -f "bestaudio[ext=m4a]/bestaudio" --get-url "https://www.youtube.com/watch?v=${videoId}"`,
+    
+    // Strategy 2: TV client
+    `yt-dlp --no-playlist --no-warnings --extractor-args "youtube:player_client=tv_embedded" -f "bestaudio" --get-url "https://www.youtube.com/watch?v=${videoId}"`,
+
+    // Strategy 3: iOS client
+    `yt-dlp --no-playlist --no-warnings --extractor-args "youtube:player_client=ios" -f "bestaudio" --get-url "https://www.youtube.com/watch?v=${videoId}"`,
+
+    // Strategy 4: Invidious instance as source
+    `yt-dlp --no-playlist --no-warnings -f "bestaudio" --get-url "https://yewtu.be/watch?v=${videoId}"`,
+  ];
+
+  for (const cmd of strategies) {
+    try {
+      console.log(`Trying: ${cmd.substring(0, 60)}...`);
+      const { stdout } = await execAsync(cmd, { timeout: 30000 });
+      const url = stdout.trim().split('\n')[0];
+      if (url && url.startsWith('http')) {
+        console.log(`Success with strategy`);
+        return url;
+      }
+    } catch (e) {
+      console.log(`Strategy failed: ${e.message.substring(0, 100)}`);
+    }
+  }
+  return null;
+}
 
 app.get('/health', (req, res) => {
   res.json({ status: 'ok' });
@@ -26,57 +57,28 @@ app.get('/stream/:videoId', async (req, res) => {
 
   const cached = cache.get(videoId);
   if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
-    console.log(`Cache hit: ${videoId}`);
     return res.json({ url: cached.url, videoId });
   }
 
-  try {
-    console.log(`Resolving: ${videoId}`);
-
-    const cmd = [
-      'yt-dlp',
-      '--no-playlist',
-      '--no-warnings',
-      '--no-check-certificates',
-      // Bypass bot detection
-      '--extractor-args', '"youtube:player_client=android,web"',
-      '--add-header', '"User-Agent:Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.6099.210 Mobile Safari/537.36"',
-      '--add-header', '"Accept-Language:en-US,en;q=0.9"',
-      '-f', 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best',
-      '--get-url',
-      `"https://www.youtube.com/watch?v=${videoId}"`
-    ].join(' ');
-
-    const { stdout } = await execAsync(cmd, { timeout: 45000 });
-    const url = stdout.trim().split('\n')[0];
-
-    if (!url || !url.startsWith('http')) {
-      return res.status(404).json({ error: 'Could not resolve audio URL' });
-    }
-
-    cache.set(videoId, { url, timestamp: Date.now() });
-    console.log(`OK: ${videoId}`);
-    res.json({ url, videoId });
-
-  } catch (err) {
-    console.error(`Error ${videoId}:`, err.message);
-
-    // Try fallback with piped.video
-    try {
-      const fallbackCmd = `yt-dlp --no-playlist --no-warnings -f bestaudio --get-url "https://piped.video/watch?v=${videoId}"`;
-      const { stdout: fb } = await execAsync(fallbackCmd, { timeout: 30000 });
-      const fbUrl = fb.trim().split('\n')[0];
-      if (fbUrl && fbUrl.startsWith('http')) {
-        cache.set(videoId, { url: fbUrl, timestamp: Date.now() });
-        return res.json({ url: fbUrl, videoId });
-      }
-    } catch (e2) {
-      console.error('Fallback also failed:', e2.message);
-    }
-
-    res.status(500).json({ error: 'Failed', detail: err.message });
+  const url = await resolveAudio(videoId);
+  
+  if (!url) {
+    return res.status(403).json({ 
+      error: 'YouTube заблокировал запрос. Попробуй другой трек или подожди немного.' 
+    });
   }
+
+  cache.set(videoId, { url, timestamp: Date.now() });
+  res.json({ url, videoId });
 });
+
+// Update yt-dlp every 6 hours to stay fresh
+setInterval(async () => {
+  try {
+    await execAsync('yt-dlp -U');
+    console.log('yt-dlp updated');
+  } catch (e) {}
+}, 6 * 60 * 60 * 1000);
 
 setInterval(() => {
   const now = Date.now();
@@ -85,4 +87,4 @@ setInterval(() => {
   }
 }, 60 * 60 * 1000);
 
-app.listen(PORT, () => console.log(`Server on port ${PORT}`));
+app.listen(PORT, () => console.log(`Stupid Music Server on port ${PORT}`));
