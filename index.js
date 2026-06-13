@@ -1,51 +1,77 @@
 const express = require('express');
 const cors = require('cors');
-const { exec, execSync } = require('child_process');
-const { promisify } = require('util');
+const https = require('https');
+const http = require('http');
 
-const execAsync = promisify(exec);
 const app = express();
 const PORT = process.env.PORT || 3000;
-
 app.use(cors());
 
 const cache = new Map();
-const CACHE_TTL = 2 * 60 * 60 * 1000;
+const CACHE_TTL = 3 * 60 * 60 * 1000; // 3 hours
 
-// Try multiple strategies to get audio URL
-async function resolveAudio(videoId) {
-  const strategies = [
-    // Strategy 1: Android client (bypasses most bot detection)
-    `yt-dlp --no-playlist --no-warnings --extractor-args "youtube:player_client=android" -f "bestaudio[ext=m4a]/bestaudio" --get-url "https://www.youtube.com/watch?v=${videoId}"`,
-    
-    // Strategy 2: TV client
-    `yt-dlp --no-playlist --no-warnings --extractor-args "youtube:player_client=tv_embedded" -f "bestaudio" --get-url "https://www.youtube.com/watch?v=${videoId}"`,
+// Public Piped instances — tried in order
+const PIPED_INSTANCES = [
+  'pipedapi.kavin.rocks',
+  'pipedapi.moomoo.me',
+  'piped-api.garudalinux.org',
+  'api.piped.yt',
+  'pipedapi.in.projectsegfau.lt',
+];
 
-    // Strategy 3: iOS client
-    `yt-dlp --no-playlist --no-warnings --extractor-args "youtube:player_client=ios" -f "bestaudio" --get-url "https://www.youtube.com/watch?v=${videoId}"`,
+function fetchJson(hostname, path) {
+  return new Promise((resolve, reject) => {
+    const options = {
+      hostname,
+      path,
+      method: 'GET',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36',
+        'Accept': 'application/json',
+      },
+      timeout: 10000,
+    };
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try { resolve({ status: res.statusCode, body: JSON.parse(data) }); }
+        catch (e) { reject(new Error('JSON parse error')); }
+      });
+    });
+    req.on('error', reject);
+    req.on('timeout', () => { req.destroy(); reject(new Error('Timeout')); });
+    req.end();
+  });
+}
 
-    // Strategy 4: Invidious instance as source
-    `yt-dlp --no-playlist --no-warnings -f "bestaudio" --get-url "https://yewtu.be/watch?v=${videoId}"`,
-  ];
-
-  for (const cmd of strategies) {
+async function resolveWithPiped(videoId) {
+  for (const instance of PIPED_INSTANCES) {
     try {
-      console.log(`Trying: ${cmd.substring(0, 60)}...`);
-      const { stdout } = await execAsync(cmd, { timeout: 30000 });
-      const url = stdout.trim().split('\n')[0];
-      if (url && url.startsWith('http')) {
-        console.log(`Success with strategy`);
-        return url;
+      console.log(`Trying Piped: ${instance}`);
+      const { status, body } = await fetchJson(instance, `/streams/${videoId}`);
+      
+      if (status !== 200 || !body.audioStreams) continue;
+
+      // Pick best audio stream — prefer m4a, then webm, then any
+      const streams = body.audioStreams;
+      const m4a = streams.find(s => s.mimeType && s.mimeType.includes('m4a'));
+      const webm = streams.find(s => s.mimeType && s.mimeType.includes('webm'));
+      const best = m4a || webm || streams[0];
+
+      if (best && best.url) {
+        console.log(`Got stream from ${instance}: ${best.mimeType} ${best.bitrate}bps`);
+        return best.url;
       }
     } catch (e) {
-      console.log(`Strategy failed: ${e.message.substring(0, 100)}`);
+      console.log(`${instance} failed: ${e.message}`);
     }
   }
   return null;
 }
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok' });
+  res.json({ status: 'ok', instances: PIPED_INSTANCES.length });
 });
 
 app.get('/stream/:videoId', async (req, res) => {
@@ -55,31 +81,24 @@ app.get('/stream/:videoId', async (req, res) => {
     return res.status(400).json({ error: 'Invalid videoId' });
   }
 
+  // Cache check
   const cached = cache.get(videoId);
   if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
+    console.log(`Cache hit: ${videoId}`);
     return res.json({ url: cached.url, videoId });
   }
 
-  const url = await resolveAudio(videoId);
-  
+  const url = await resolveWithPiped(videoId);
+
   if (!url) {
-    return res.status(403).json({ 
-      error: 'YouTube заблокировал запрос. Попробуй другой трек или подожди немного.' 
-    });
+    return res.status(404).json({ error: 'Не удалось получить аудио. Попробуй другой трек.' });
   }
 
   cache.set(videoId, { url, timestamp: Date.now() });
   res.json({ url, videoId });
 });
 
-// Update yt-dlp every 6 hours to stay fresh
-setInterval(async () => {
-  try {
-    await execAsync('yt-dlp -U');
-    console.log('yt-dlp updated');
-  } catch (e) {}
-}, 6 * 60 * 60 * 1000);
-
+// Clear expired cache
 setInterval(() => {
   const now = Date.now();
   for (const [k, v] of cache.entries()) {
