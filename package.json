@@ -1,0 +1,17 @@
+{
+  "name": "stupid-music-server",
+  "version": "1.0.0",
+  "description": "Audio stream resolver for Stupid Music app",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "postinstall": "python3 -m pip install yt-dlp --break-system-packages 2>/dev/null || pip3 install yt-dlp 2>/dev/null || true"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
